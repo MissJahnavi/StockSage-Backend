@@ -1,0 +1,36 @@
+fastapi
+uvicorn[standard]
+
+# Core (compatible set)
+pydantic
+pydantic-settings
+python-dotenv
+
+# LangChain stack
+langchain
+langchain-core
+langchain-community
+langchain-google-genai
+langchain-text-splitters
+langsmith
+
+# Data
+massive
+ta
+pandas
+numpy
+
+# News & Sentiment
+newsapi-python
+vaderSentiment
+requests
+
+# Vector Store
+faiss-cpu
+# Utils
+tenacity
+loguru
+# Testing
+pytest
+pytest-asyncio
+httpx

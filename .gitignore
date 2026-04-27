@@ -1,0 +1,34 @@
+# ── Secrets (CRITICAL) ─────────────────────────────────────────────
+.env
+.env.*
+
+# ── Python virtual environments ────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Python compiled / build artifacts ──────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# ── Test / tool cache ──────────────────────────────────────────────
+.pytest_cache/
+
+# ── Runtime generated files ────────────────────────────────────────
+logs/
+*.log
+data/faiss_index/   # FAISS index (do NOT store)
+
+# ── IDE ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+
+# ── OS ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
