@@ -1,28 +1,30 @@
 import pandas as pd
 from datetime import date, timedelta
 from loguru import logger
-from massive import RESTClient  # pip install massive  (Polygon.io rebranded SDK)
+import massive
 from app.core.config import settings
 from app.data.fallback_data import FALLBACK_STOCKS, DEFAULT_STOCK
 
-# ── Massive (Polygon.io) free-tier endpoints used ─────────────────────────────
-#
-#  get_snapshot_all / get_snapshot_ticker  → current price, change%, volume
-#  list_aggs                               → OHLCV bars (up to 100 days)
-#  get_ticker_details                      → company name, market cap, etc.
-#
-#  Get a free key at: https://massive.com  (same key works on polygon.io too)
-# ─────────────────────────────────────────────────────────────────────────────
+
+# Period string → calendar days to look back
+PERIOD_DAYS = {
+    "1mo":  40,
+    "3mo":  100,
+    "6mo":  190,
+    "1y":   370,
+    "2y":   740,
+    "5y":   1830,
+}
 
 
-def _get_client() -> RESTClient:
-    """Return an authenticated Massive/Polygon REST client."""
+def _get_client() -> massive.RESTClient:
+    """Return an authenticated Massive REST client."""
     if not settings.POLYGON_API_KEY:
         raise ValueError("POLYGON_API_KEY not set in .env")
-    return RESTClient(api_key=settings.POLYGON_API_KEY)
+    return massive.RESTClient(settings.POLYGON_API_KEY)
 
 
-# ── Technical indicators (unchanged — works on any OHLCV DataFrame) ───────────
+# ── Technical indicators ───────────────────────────────────────────────────────
 
 def _compute_indicators(df: pd.DataFrame) -> dict:
     """Compute RSI, MACD, Bollinger Bands, ATR, SMA from OHLCV DataFrame."""
@@ -65,52 +67,38 @@ def _compute_indicators(df: pd.DataFrame) -> dict:
         }
 
 
-# ── Massive / Polygon.io fetch ─────────────────────────────────────────────────
+# ── Massive fetch (free endpoints only) ───────────────────────────────────────
 
-def _fetch_from_massive(ticker: str) -> dict:
+def _fetch_from_massive(ticker: str, period: str = "6mo") -> dict:
     """
-    Fetch live stock data via the Massive (Polygon.io) Python client.
+    Fetch stock data using only free-tier Massive (Polygon.io) endpoints.
 
-      Call 1 — get_snapshot_ticker  : current price, change %, volume, OHLC
-      Call 2 — list_aggs            : last ~100 days of OHLCV bars
-      Call 3 — get_ticker_details   : company name, market cap, description
+      get_aggs → OHLCV bars for the requested period  ✅ FREE
 
-    Returns a dict with the same shape as the previous Alpha Vantage version so
-    nothing downstream (agent, schemas, routers, frontend) needs to change.
+    Current price, change%, volume are derived from the latest bar —
+    no paid snapshot endpoint needed.
     """
     client = _get_client()
 
-    # ── Call 1: Current snapshot ──────────────────────────────────────────────
-    snapshot = client.get_snapshot_ticker("stocks", ticker)
-    day       = snapshot.day        # today's OHLCV
-    prev_day  = snapshot.prev_day   # previous day's close
+    # ── Date range ────────────────────────────────────────────────────────────
+    days_back = PERIOD_DAYS.get(period, 190)
+    from_date = (date.today() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    to_date   = date.today().strftime("%Y-%m-%d")
 
-    current_price = float(snapshot.last_trade.price if snapshot.last_trade else day.close or 0)
-    day_open      = float(day.open  or current_price)
-    day_high      = float(day.high  or current_price)
-    day_low       = float(day.low   or current_price)
-    volume        = int(day.volume  or 0)
-    prev_close    = float(prev_day.close if prev_day else current_price)
-    change_pct    = float(snapshot.todays_change_perc or 0)
-
-    # ── Call 2: ~100 trading-day aggregate bars ───────────────────────────────
-    from_date = (date.today() - timedelta(days=140)).isoformat()  # buffer for weekends/holidays
-    to_date   = date.today().isoformat()
-
-    aggs = list(client.list_aggs(
+    # ── Fetch OHLCV bars via get_aggs (same as working test code) ────────────
+    aggs      = client.get_aggs(
         ticker=ticker,
         multiplier=1,
         timespan="day",
         from_=from_date,
         to=to_date,
-        adjusted=True,
-        sort="asc",
-        limit=120,
-    ))
+    )
+    aggs_list = list(aggs)
 
-    if not aggs:
-        raise ValueError(f"Massive returned no aggregate bars for '{ticker}'")
+    if not aggs_list:
+        raise ValueError(f"Massive returned no data for '{ticker}' ({from_date} → {to_date})")
 
+    # ── Build DataFrame ───────────────────────────────────────────────────────
     rows = [
         {
             "Date":   pd.to_datetime(a.timestamp, unit="ms"),
@@ -120,11 +108,21 @@ def _fetch_from_massive(ticker: str) -> dict:
             "Close":  float(a.close),
             "Volume": float(a.volume),
         }
-        for a in aggs
+        for a in aggs_list
     ]
     df = pd.DataFrame(rows).set_index("Date")
 
-    # Last 90 points for the price-history chart
+    # ── Derive price stats from bars (no snapshot needed) ─────────────────────
+    latest        = df.iloc[-1]
+    prev          = df.iloc[-2] if len(df) >= 2 else latest
+    current_price = round(float(latest["Close"]), 2)
+    prev_close    = round(float(prev["Close"]), 2)
+    change_pct    = round(((current_price - prev_close) / prev_close) * 100, 2) if prev_close else 0.0
+    volume        = int(latest["Volume"])
+    week_52_high  = round(float(df["High"].max()), 2)
+    week_52_low   = round(float(df["Low"].min()), 2)
+
+    # ── Price history for chart (last 90 bars) ────────────────────────────────
     price_history = [
         {"date": str(idx.date()), "close": round(float(row["Close"]), 2)}
         for idx, row in df.tail(90).iterrows()
@@ -132,56 +130,45 @@ def _fetch_from_massive(ticker: str) -> dict:
 
     indicators = _compute_indicators(df)
 
-    # ── Call 3: Ticker details (company info) ─────────────────────────────────
+    # ── Company name & market cap (free endpoint, best-effort) ───────────────
     company_name = ticker
     market_cap   = 0
     pe_ratio     = 0.0
-    week_52_high = day_high
-    week_52_low  = day_low
 
     try:
         details      = client.get_ticker_details(ticker)
         company_name = details.name or ticker
         market_cap   = int(details.market_cap or 0)
-        # P/E ratio is not in ticker details; keep 0 (available via financials endpoint on paid plans)
-        week_52_high = float(snapshot.last_quote.high if hasattr(snapshot, "last_quote") and snapshot.last_quote else df["High"].max())
-        week_52_low  = float(snapshot.last_quote.low  if hasattr(snapshot, "last_quote") and snapshot.last_quote else df["Low"].min())
     except Exception as e:
         logger.warning(f"Massive ticker details failed for {ticker}: {e}. Using defaults.")
-        week_52_high = float(df["High"].max())
-        week_52_low  = float(df["Low"].min())
 
     return {
         "ticker":         ticker.upper(),
         "company_name":   company_name,
-        "current_price":  round(current_price, 2),
-        "change_percent": round(change_pct, 2),
+        "current_price":  current_price,
+        "change_percent": change_pct,
         "volume":         volume,
         "market_cap":     market_cap,
-        "pe_ratio":       round(pe_ratio, 2),
-        "week_52_high":   round(week_52_high, 2),
-        "week_52_low":    round(week_52_low, 2),
+        "pe_ratio":       pe_ratio,
+        "week_52_high":   week_52_high,
+        "week_52_low":    week_52_low,
         "price_history":  price_history,
         **indicators,
     }
 
 
-# ── Public interface (unchanged signature) ────────────────────────────────────
+# ── Public interface ───────────────────────────────────────────────────────────
 
 def get_stock_data(ticker: str, period: str = "6mo") -> dict:
     """
-    Fetch stock data via the Massive (Polygon.io) Python client.
-    Falls back to hardcoded data if Massive fails (no key, rate limit, etc.).
+    Fetch stock data via Massive (Polygon.io) free-tier endpoints.
+    Falls back to hardcoded data if Massive fails.
     Always returns a safe dict — never raises.
-
-    NOTE: `period` param is accepted for API compatibility but ignored —
-    list_aggs always fetches the last ~100 trading days, which covers the
-    default 6mo period well enough.
     """
     ticker = ticker.upper().strip()
     try:
-        data = _fetch_from_massive(ticker)
-        logger.info(f"Fetched live data from Massive for {ticker}")
+        data = _fetch_from_massive(ticker, period)
+        logger.info(f"Fetched live data from Massive for {ticker} (period={period})")
         return data
     except Exception as e:
         logger.warning(f"Massive failed for {ticker}: {e}. Using fallback data.")
