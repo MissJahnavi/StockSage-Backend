@@ -8,4 +8,4 @@ if sys.platform == "win32":
 
 if __name__ == "__main__":
     os.makedirs("logs", exist_ok=True)
-    uvicorn.run("app.main:app", host="127.0.0.1", port=8008, reload=False)
+    uvicorn.run("app.main:app", host="127.0.0.1", port=8004, reload=False)
